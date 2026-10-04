@@ -27164,39 +27164,95 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
   let currentUser = null;
   let cloudSnapshot = null;
   let autosaveInterval = null;
-  let lastUploadedSnapshot = null;
-  let saveInFlight = false;
+  let autosaveInFlight = false;
+  let autosaveQueued = false;
+
+  function allLocalData(){
+    const out = {};
+    for(let i=0;i<localStorage.length;i++){
+      const k = localStorage.key(i);
+      if(!k || SKIP_KEY.test(k)) continue;
+      try { out[k] = localStorage.getItem(k); } catch(e) {}
+    }
+    return out;
+  }
+
+  function localHasOrochiData(){
+    const d = allLocalData();
+    return Object.keys(d).some(k => /^orochi_|^review_|^journal_meta_/.test(k));
+  }
 
   function getLocalSnapshot(){
-    try { return JSON.stringify(allLocalData()); } catch(e) { return null; }
+    try { return JSON.stringify(allLocalData()); }
+    catch(e) { return null; }
+  }
+
+  async function readCloud(){
+    if(!currentUser) return null;
+    const {data,error} = await client
+      .from(CLOUD_TABLE)
+      .select('user_id,data,updated_at')
+      .eq('user_id', currentUser.id)
+      .maybeSingle();
+    if(error) throw error;
+    return data;
+  }
+
+  async function writeCloud(){
+    if(!currentUser || syncing) return false;
+    const payloadData = allLocalData();
+    const {error} = await client
+      .from(CLOUD_TABLE)
+      .upsert({
+        user_id: currentUser.id,
+        data: payloadData,
+        updated_at: new Date().toISOString()
+      }, {onConflict:'user_id'});
+    if(error) throw error;
+    cloudSnapshot = JSON.stringify(payloadData);
+    setStatus('Saved to cloud');
+    return true;
   }
 
   async function saveIfChanged(){
-    if(!currentUser || syncing || saveInFlight) return;
+    if(!currentUser || syncing || autosaveInFlight) return;
     const snapshot = getLocalSnapshot();
-    if(snapshot === null || snapshot === lastUploadedSnapshot) return;
-    saveInFlight = true;
+    if(snapshot === null || snapshot === cloudSnapshot) return;
+    autosaveInFlight = true;
     try {
       await writeCloud();
-      lastUploadedSnapshot = getLocalSnapshot();
     } catch(e) {
-      setStatus('Cloud save failed — will retry automatically');
+      setStatus('Cloud save failed — retrying automatically');
       console.error('Orochi automatic cloud save:', e);
     } finally {
-      saveInFlight = false;
+      autosaveInFlight = false;
+      if(autosaveQueued){
+        autosaveQueued = false;
+        setTimeout(saveIfChanged, 50);
+      }
     }
+  }
+
+  function scheduleCloudSave(){
+    if(!currentUser || syncing) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(()=>{
+      if(autosaveInFlight){ autosaveQueued = true; return; }
+      saveIfChanged();
+    }, 800);
   }
 
   function startAutosave(){
     if(autosaveInterval) return;
-    lastUploadedSnapshot = getLocalSnapshot();
-    autosaveInterval = setInterval(saveIfChanged, 1500);
+    if(cloudSnapshot === null) cloudSnapshot = getLocalSnapshot();
+    autosaveInterval = setInterval(saveIfChanged, 1000);
   }
 
   function stopAutosave(){
     if(autosaveInterval){ clearInterval(autosaveInterval); autosaveInterval=null; }
-    lastUploadedSnapshot = null;
-    saveInFlight = false;
+    clearTimeout(saveTimer);
+    autosaveInFlight = false;
+    autosaveQueued = false;
   }
 
   function patchLocalStorage(){
@@ -27226,7 +27282,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     window.addEventListener('pagehide', ()=>{
       if(currentUser && !syncing) {
         clearTimeout(saveTimer);
-        writeCloud().catch(e=>console.error('Orochi final cloud save:',e));
+        saveIfChanged();
       }
     });
   }
@@ -27351,6 +27407,8 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     const {data,error}=await client.auth.signInWithPassword({email,password});
     if(error){setStatus(error.message);return;}
     currentUser=data.user;
+    patchLocalStorage();
+    startAutosave();
     try{
       const cloud=await readCloud();
       if(!cloud || !cloud.data || Object.keys(cloud.data).length===0){
@@ -27360,9 +27418,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
         setStatus('Connected. This device is now uploaded to the cloud.');
       }else{
         setLoggedInUI();
-        $('orochi-cloud-connected').style.display='none';
-        $('orochi-cloud-choice').style.display='block';
-        setStatus('Cloud data found.');
+        setStatus('Connected. Automatic cloud saving is active.');
       }
     }catch(e){setStatus('Connection error: '+(e.message||e));console.error(e);}
   };
@@ -27377,7 +27433,9 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     if(error){setStatus(error.message);return;}
     if(data.session){
       currentUser=data.user;
-      try{await writeCloud();patchLocalStorage();setLoggedInUI();setStatus('Account created and current device uploaded.');}
+      patchLocalStorage();
+      startAutosave();
+      try{await writeCloud();setLoggedInUI();setStatus('Account created and current device uploaded.');}
       catch(e){setStatus(e.message||String(e));}
     }else{
       setStatus('Account created. Check your email to confirm it, then sign in.');
@@ -27393,6 +27451,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
       Object.keys(localStorage).forEach(k=>{if(!SKIP_KEY.test(k)) localStorage.removeItem(k);});
       Object.entries(cloud.data).forEach(([k,v])=>localStorage.setItem(k,v));
       syncing=false;
+      cloudSnapshot = getLocalSnapshot();
       setStatus('Cloud data loaded. Reloading…');
       setTimeout(()=>location.reload(),700);
     }catch(e){syncing=false;setStatus(e.message||String(e));}
@@ -27423,6 +27482,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
         Object.keys(localStorage).forEach(k=>{if(!SKIP_KEY.test(k)) localStorage.removeItem(k);});
         Object.entries(cloud.data).forEach(([k,v])=>localStorage.setItem(k,v));
       } finally { syncing=false; }
+      cloudSnapshot = getLocalSnapshot();
       setStatus('Cloud data refreshed. Reloading…');
       setTimeout(()=>location.reload(),300);
     }catch(e){syncing=false;setStatus('Refresh failed: '+(e.message||e));}
@@ -27470,11 +27530,9 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
   client.auth.getSession().then(async({data})=>{
     if(!data.session) return;
     currentUser=data.session.user;
-    // Install the automatic-save hook as soon as an authenticated session
-    // exists. This must happen even when cloud data already exists; otherwise
-    // the 'Use Cloud Data' path could reload the page without ever installing
-    // the save hook.
+    // Install automatic cloud saving for every restored authenticated session.
     patchLocalStorage();
+    startAutosave();
     try{
       const cloud=await readCloud();
       if(cloud && cloud.data && Object.keys(cloud.data).length){
