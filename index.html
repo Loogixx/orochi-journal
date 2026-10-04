@@ -27164,72 +27164,39 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
   let currentUser = null;
   let cloudSnapshot = null;
   let autosaveInterval = null;
+  let lastUploadedSnapshot = null;
+  let saveInFlight = false;
 
-  function allLocalData(){
-    const out = {};
-    for(let i=0;i<localStorage.length;i++){
-      const k = localStorage.key(i);
-      if(!k || SKIP_KEY.test(k)) continue;
-      try { out[k] = localStorage.getItem(k); } catch(e) {}
+  function getLocalSnapshot(){
+    try { return JSON.stringify(allLocalData()); } catch(e) { return null; }
+  }
+
+  async function saveIfChanged(){
+    if(!currentUser || syncing || saveInFlight) return;
+    const snapshot = getLocalSnapshot();
+    if(snapshot === null || snapshot === lastUploadedSnapshot) return;
+    saveInFlight = true;
+    try {
+      await writeCloud();
+      lastUploadedSnapshot = getLocalSnapshot();
+    } catch(e) {
+      setStatus('Cloud save failed — will retry automatically');
+      console.error('Orochi automatic cloud save:', e);
+    } finally {
+      saveInFlight = false;
     }
-    return out;
-  }
-
-  function localHasOrochiData(){
-    const d = allLocalData();
-    return Object.keys(d).some(k => /^orochi_|^review_|^journal_meta_/.test(k));
-  }
-
-  async function readCloud(){
-    if(!currentUser) return null;
-    const {data,error} = await client
-      .from(CLOUD_TABLE)
-      .select('user_id,data,updated_at')
-      .eq('user_id', currentUser.id)
-      .maybeSingle();
-    if(error) throw error;
-    return data;
-  }
-
-  async function writeCloud(){
-    if(!currentUser || syncing) return;
-    const payload = {
-      user_id: currentUser.id,
-      data: allLocalData(),
-      updated_at: new Date().toISOString()
-    };
-    const {error} = await client
-      .from(CLOUD_TABLE)
-      .upsert(payload, {onConflict:'user_id'});
-    if(error) throw error;
-    cloudSnapshot = JSON.stringify(allLocalData());
-    setStatus('Saved to cloud');
-  }
-
-  function scheduleCloudSave(){
-    if(!currentUser || syncing) return;
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(async()=>{
-      try { await writeCloud(); }
-      catch(e) { setStatus('Cloud save failed'); console.error('Orochi cloud save:',e); }
-    }, 800);
   }
 
   function startAutosave(){
     if(autosaveInterval) return;
-    cloudSnapshot = JSON.stringify(allLocalData());
-    autosaveInterval = setInterval(async()=>{
-      if(!currentUser || syncing) return;
-      const next = JSON.stringify(allLocalData());
-      if(next !== cloudSnapshot){
-        cloudSnapshot = next;
-        scheduleCloudSave();
-      }
-    }, 2000);
+    lastUploadedSnapshot = getLocalSnapshot();
+    autosaveInterval = setInterval(saveIfChanged, 1500);
   }
 
   function stopAutosave(){
     if(autosaveInterval){ clearInterval(autosaveInterval); autosaveInterval=null; }
+    lastUploadedSnapshot = null;
+    saveInFlight = false;
   }
 
   function patchLocalStorage(){
