@@ -27215,16 +27215,32 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
   function patchLocalStorage(){
     if(window.__orochiStoragePatched) return;
     window.__orochiStoragePatched = true;
-    const originalSet = localStorage.setItem.bind(localStorage);
-    const originalRemove = localStorage.removeItem.bind(localStorage);
-    localStorage.setItem = function(k,v){
-      originalSet(k,v);
-      if(!SKIP_KEY.test(String(k))) scheduleCloudSave();
+
+    // Patch Storage.prototype rather than the localStorage object itself.
+    // Some browsers expose setItem/removeItem as non-overridable methods on
+    // the Storage object, so assigning localStorage.setItem can silently fail.
+    const proto = Storage.prototype;
+    const originalSet = proto.setItem;
+    const originalRemove = proto.removeItem;
+
+    proto.setItem = function(k,v){
+      const result = originalSet.call(this,k,v);
+      if(this === window.localStorage && !SKIP_KEY.test(String(k))) scheduleCloudSave();
+      return result;
     };
-    localStorage.removeItem = function(k){
-      originalRemove(k);
-      if(!SKIP_KEY.test(String(k))) scheduleCloudSave();
+    proto.removeItem = function(k){
+      const result = originalRemove.call(this,k);
+      if(this === window.localStorage && !SKIP_KEY.test(String(k))) scheduleCloudSave();
+      return result;
     };
+
+    // Save any last-minute changes when the page is being hidden/closed.
+    window.addEventListener('pagehide', ()=>{
+      if(currentUser && !syncing) {
+        clearTimeout(saveTimer);
+        writeCloud().catch(e=>console.error('Orochi final cloud save:',e));
+      }
+    });
   }
 
   const wrap = document.createElement('div');
