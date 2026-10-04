@@ -27162,6 +27162,8 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
   let syncing = false;
   let saveTimer = null;
   let currentUser = null;
+  let cloudSnapshot = null;
+  let autosaveInterval = null;
 
   function allLocalData(){
     const out = {};
@@ -27182,7 +27184,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     if(!currentUser) return null;
     const {data,error} = await client
       .from(CLOUD_TABLE)
-      .select('id,data,updated_at')
+      .select('user_id,data,updated_at')
       .eq('user_id', currentUser.id)
       .maybeSingle();
     if(error) throw error;
@@ -27200,6 +27202,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
       .from(CLOUD_TABLE)
       .upsert(payload, {onConflict:'user_id'});
     if(error) throw error;
+    cloudSnapshot = JSON.stringify(allLocalData());
     setStatus('Saved to cloud');
   }
 
@@ -27212,7 +27215,25 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     }, 800);
   }
 
+  function startAutosave(){
+    if(autosaveInterval) return;
+    cloudSnapshot = JSON.stringify(allLocalData());
+    autosaveInterval = setInterval(async()=>{
+      if(!currentUser || syncing) return;
+      const next = JSON.stringify(allLocalData());
+      if(next !== cloudSnapshot){
+        cloudSnapshot = next;
+        scheduleCloudSave();
+      }
+    }, 2000);
+  }
+
+  function stopAutosave(){
+    if(autosaveInterval){ clearInterval(autosaveInterval); autosaveInterval=null; }
+  }
+
   function patchLocalStorage(){
+    startAutosave();
     if(window.__orochiStoragePatched) return;
     window.__orochiStoragePatched = true;
 
@@ -27262,7 +27283,9 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
         color:#fff;font:13px Arial,sans-serif;display:none
       }
       #orochi-cloud-panel.open{display:block}
-      #orochi-cloud-panel h3{margin:0 0 6px;font-size:15px}
+      #orochi-cloud-panel .orochi-cloud-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+      #orochi-cloud-panel h3{margin:0;font-size:15px}
+      #orochi-cloud-close{width:auto!important;margin:0!important;padding:2px 7px!important;background:transparent!important;color:rgba(255,255,255,.55)!important;font-size:18px!important;line-height:1;border:0!important}
       #orochi-cloud-panel p{margin:0 0 12px;color:rgba(255,255,255,.55);line-height:1.5}
       #orochi-cloud-panel input{
         width:100%;padding:10px 11px;margin:5px 0;background:#181818;
@@ -27280,7 +27303,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     </style>
     <button id="orochi-cloud-btn">☁ Cloud</button>
     <div id="orochi-cloud-panel">
-      <h3>Orochi Cloud Sync</h3>
+      <div class="orochi-cloud-head"><h3>Orochi Cloud Sync</h3><button id="orochi-cloud-close" aria-label="Close">×</button></div>
       <p id="orochi-cloud-user"></p>
       <div id="orochi-cloud-login">
         <p>Use the same Orochi account on every device.</p>
@@ -27296,6 +27319,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
       </div>
       <div id="orochi-cloud-connected" style="display:none">
         <button id="orochi-sync-now">Sync Now</button>
+        <button id="orochi-refresh-cloud" class="secondary">Refresh from Cloud</button>
         <button id="orochi-import" class="secondary">Import Backup JSON</button>
         <button id="orochi-export" class="secondary">Export Cloud Backup</button>
         <input id="orochi-import-file" type="file" accept="application/json,.json" style="display:none">
@@ -27312,6 +27336,8 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
 
   function setStatus(msg){ status.textContent = msg; }
   function openPanel(){ panel.classList.add('open'); }
+  function closePanel(){ panel.classList.remove('open'); }
+  $('orochi-cloud-close').onclick = closePanel;
   function setLoggedInUI(){
     $('orochi-cloud-login').style.display='none';
     $('orochi-cloud-choice').style.display='none';
@@ -27420,6 +27446,21 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     try{setStatus('Saving…');await writeCloud();}catch(e){setStatus(e.message||String(e));}
   };
 
+  $('orochi-refresh-cloud').onclick = async()=>{
+    try{
+      setStatus('Refreshing from cloud…');
+      const cloud=await readCloud();
+      if(!cloud || !cloud.data){setStatus('No cloud data found.');return;}
+      syncing=true;
+      try{
+        Object.keys(localStorage).forEach(k=>{if(!SKIP_KEY.test(k)) localStorage.removeItem(k);});
+        Object.entries(cloud.data).forEach(([k,v])=>localStorage.setItem(k,v));
+      } finally { syncing=false; }
+      setStatus('Cloud data refreshed. Reloading…');
+      setTimeout(()=>location.reload(),300);
+    }catch(e){syncing=false;setStatus('Refresh failed: '+(e.message||e));}
+  };
+
   $('orochi-import').onclick = ()=>$('orochi-import-file').click();
   $('orochi-import-file').onchange = async(e)=>{
     const file=e.target.files && e.target.files[0];
@@ -27454,6 +27495,7 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     clearTimeout(saveTimer);
     await client.auth.signOut();
     currentUser=null;
+    stopAutosave();
     setLoggedOutUI();
     setStatus('Signed out.');
   };
@@ -27469,12 +27511,19 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
     try{
       const cloud=await readCloud();
       if(cloud && cloud.data && Object.keys(cloud.data).length){
-        // Existing session on a new device: let the user choose explicitly.
-        openPanel();
-        setLoggedInUI();
-        $('orochi-cloud-connected').style.display='none';
-        $('orochi-cloud-choice').style.display='block';
-        setStatus('Cloud data found.');
+        const localKeys = Object.keys(allLocalData());
+        if(localKeys.length===0){
+          syncing=true;
+          try{
+            Object.entries(cloud.data).forEach(([k,v])=>localStorage.setItem(k,v));
+          } finally { syncing=false; }
+          setLoggedInUI();
+          setStatus('Cloud data loaded automatically.');
+          setTimeout(()=>location.reload(),300);
+        }else{
+          setLoggedInUI();
+          setStatus('Connected. Automatic cloud saving is active.');
+        }
       }else{
         setLoggedInUI();
         setStatus('Connected. Automatic cloud saving is active.');
