@@ -27461,6 +27461,11 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
   client.auth.getSession().then(async({data})=>{
     if(!data.session) return;
     currentUser=data.session.user;
+    // Install the automatic-save hook as soon as an authenticated session
+    // exists. This must happen even when cloud data already exists; otherwise
+    // the 'Use Cloud Data' path could reload the page without ever installing
+    // the save hook.
+    patchLocalStorage();
     try{
       const cloud=await readCloud();
       if(cloud && cloud.data && Object.keys(cloud.data).length){
@@ -27471,15 +27476,19 @@ const numGuard=e=>{if(e.target.tagName==='INPUT'&&e.target.type==='number'){if([
         $('orochi-cloud-choice').style.display='block';
         setStatus('Cloud data found.');
       }else{
-        patchLocalStorage();
         setLoggedInUI();
-        setStatus('Connected.');
+        setStatus('Connected. Automatic cloud saving is active.');
       }
     }catch(e){setStatus('Cloud check failed: '+(e.message||e));}
   });
 
   client.auth.onAuthStateChange((event,session)=>{
-    if(session) currentUser=session.user;
+    if(session){
+      currentUser=session.user;
+      patchLocalStorage();
+    } else {
+      currentUser=null;
+    }
   });
 })();
 </script>
